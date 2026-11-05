@@ -2,9 +2,94 @@
 
 <iframe width="840" height="500" src="https://www.loom.com/embed/cb74eb79df3e4c2b83a6efae54a589f9" frameBorder="0" allowFullScreen></iframe>
 
-LiteLLM acts as a **Skills Registry**, a central place to register, manage, and discover Claude Code skills across your organization. Teams publish a skill once, and developers and agents find it through a single hub and install it from one Claude Code marketplace.
+Use LiteLLM Skills Hub to upload, import, discover, and download [Agent Skills](https://agentskills.io/specification) packages for Codex, Claude Code, and other compatible agents. The neutral `/skill-hub/skills` API shares the existing registry and access grants with the Claude Code marketplace.
 
-## How it works
+## Portable Agent Skills API
+
+You need a connected database and a proxy admin key to upload or import a skill. Upload a ZIP containing `SKILL.md` at its root or inside one top-level folder. Include supporting files such as `scripts/`, `references/`, `assets/`, and `agents/openai.yaml`; the portable download preserves their bytes and executable script permissions.
+
+`SKILL.md` must declare a name and description in YAML frontmatter. Hub names use the existing ASCII registry policy: 1–64 lowercase letters, digits, and single hyphens between segments (`^[a-z0-9]+(?:-[a-z0-9]+)*$`). Unicode names are not supported. Descriptions must contain 1–1024 characters.
+
+### Upload or import
+
+A portable package can contain:
+
+```text
+pdf-summarizer/
+  SKILL.md
+  scripts/extract.sh
+  agents/openai.yaml
+```
+
+For example, `SKILL.md` can contain:
+
+```markdown
+---
+name: pdf-summarizer
+description: Summarize PDFs with page citations.
+---
+Read the PDF and cite page numbers in the summary.
+```
+
+```bash
+zip -r pdf-summarizer.zip pdf-summarizer
+curl --fail-with-body https://your-proxy/skill-hub/skills/upload \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -F "file=@pdf-summarizer.zip" \
+  -F "version=1.0.0"
+```
+
+Import a public skill from skills.sh:
+
+```bash
+curl --fail-with-body https://your-proxy/skill-hub/skills/import \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://skills.sh/vercel-labs/agent-skills/vercel-react-best-practices"}'
+```
+
+Imports accept HTTPS `skills.sh/<owner>/<repository>/<skill>` and `github.com/<owner>/<repository>` URLs. For a GitHub repository, select exactly one skill with `skill` or the repository-relative `path`. Use `ref` for a commit, tag, or branch; it defaults to `HEAD`. A GitHub tree URL can supply the ref and directory instead. LiteLLM stores a snapshot of the selected directory. An unrelated repository symlink, such as a root `CLAUDE.md`, does not block the import. Symlinks inside the selected skill are rejected. Private repositories, SSH URLs, other hosts, and arbitrary archive URLs are not supported by this import endpoint.
+
+Upload ZIPs and downloaded repository ZIPs are limited to 10 MiB. The archive must contain at most 1,000 entries and 50 MiB of unpacked data. Whole-ZIP path validation and size limits include files outside the selected skill. Existing names return `409`; import and upload do not overwrite an existing package.
+
+New uploads and imports create public registry entries. Use `POST /skill-hub/skills/{name}/unpublish` to keep a skill private and retain its explicit grants. Public CLI discovery also requires the opt-in setting below.
+
+### Browse and download
+
+Use a LiteLLM key to list public skills and private skills granted to that key or its team:
+
+```bash
+curl --fail-with-body 'https://your-proxy/skill-hub/skills?query=pdf&offset=0&limit=20' \
+  -H "Authorization: Bearer $LITELLM_API_KEY"
+
+curl --fail-with-body https://your-proxy/skill-hub/skills/pdf-summarizer/content \
+  -H "Authorization: Bearer $LITELLM_API_KEY"
+
+curl --fail-with-body https://your-proxy/skill-hub/skills/pdf-summarizer/archive \
+  -H "Authorization: Bearer $LITELLM_API_KEY" \
+  -o pdf-summarizer.zip
+```
+
+The list response contains `skills`, `count`, and `next_offset`. Each managed package provides `download_url` and `content_url`. Entries that point to external sources can appear in the shared catalog without those URLs. The content route returns the original `SKILL.md`; the archive route includes its supporting files with `SKILL.md` at the ZIP root. These routes also serve existing managed Claude uploads that contain a valid Agent Skill. External Git or URL registrations keep their original sources.
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `POST /skill-hub/skills/upload` | Proxy admin | Upload a portable ZIP; optional form field `version` |
+| `POST /skill-hub/skills/import` | Proxy admin | Snapshot a public GitHub or skills.sh skill |
+| `GET /skill-hub/skills` | LiteLLM key | Search visible skills with `query`, `offset`, and `limit` (1–100) |
+| `GET /skill-hub/skills/{name}` | LiteLLM key | Read visible skill metadata and download URLs |
+| `GET /skill-hub/skills/{name}/content` | LiteLLM key, or eligible public access | Read the original `SKILL.md` |
+| `GET /skill-hub/skills/{name}/archive` | LiteLLM key, or eligible public access | Download the portable ZIP |
+| `PUT /skill-hub/skills/{name}` | Proxy admin | Replace public metadata while preserving the archive and Claude adapter settings |
+| `POST /skill-hub/skills/{name}/publish` | Proxy admin | Make the registry entry public |
+| `POST /skill-hub/skills/{name}/unpublish` | Proxy admin | Hide it from public discovery while retaining grants |
+| `DELETE /skill-hub/skills/{name}` | Proxy admin | Delete the skill and managed archive |
+
+`PUT` accepts `description`, `version`, `domain`, `namespace`, and `keywords`. Omitted fields in that set clear. The stored package, source, and Claude adapter settings such as `installation_preference` remain unchanged.
+
+Anonymous content and archive requests require a public skill, `litellm_settings.public_skills_index: true`, and marketplace authentication disabled. Authenticated downloads remain available when the public index is off. Private skills use the existing [key and team grants](#private-skills).
+
+## Claude Code marketplace {#how-it-works}
 
 ```mermaid
 graph TD
@@ -159,17 +244,30 @@ When both the key and its team list skills, the key gets the intersection of the
 
 ## Agent Skills discovery index
 
-Skills uploaded to the proxy's own store through [`/v1/skills`](./skills.md) with `custom_llm_provider=litellm_proxy` can also be published as an [Agent Skills](https://agentskills.io) discovery index, so any agent that supports the format can install them with `npx skills add`. This store is separate from the Claude Code marketplace above: plugins registered through `/claude-code/plugins` do not appear in it.
+The Hub contributes public packages created through `/skill-hub/skills/upload` or `/skill-hub/skills/import`. Existing managed Claude uploads can use neutral downloads when valid, but do not automatically appear in this index.
 
-The index is off by default because discovery clients send no credentials, so turning it on publishes every stored skill to anyone who can reach the proxy:
+The index also retains skills uploaded to the proxy's own store through [`/v1/skills`](./skills.md) with `custom_llm_provider=litellm_proxy`. That provider-compatible API and its storage remain separate from the Hub API. The combined index contains at most 1,000 skills, with hosted-store entries retaining priority. Name collisions receive unique installation aliases, while the original `SKILL.md` remains unchanged.
+
+The index is off by default. Enabling it exposes installable skills from the hosted `/v1/skills` store to anyone who can reach the proxy, alongside eligible public Hub packages:
 
 ```yaml title="config.yaml"
 litellm_settings:
   public_skills_index: true
 ```
 
-With it on, the proxy serves the index at `GET /.well-known/agent-skills/index.json` (also at `/.well-known/skills/index.json`) and each skill as a zip at `GET /v1/skills/{skill_id}/archive`. All three routes return `404` while the setting is off. Install from a client with:
+The index is available at `GET /.well-known/agent-skills/index.json`, with `/.well-known/skills/index.json` as an alias. Hosted-store archives retain `GET /v1/skills/{skill_id}/archive`; Hub entries use `GET /skill-hub/skills/{name}/archive`. The two index routes and the hosted-store archive route return `404` while `public_skills_index` is off.
+
+Hub packages appear in the anonymous index only when they are public and `general_settings.claude_code_marketplace_auth_required` is not enabled. That authentication setting does not change the existing hosted-store publication behavior.
+
+### Install in Codex and Claude Code
+
+From your project directory, use Node.js 22.20.0 or newer and the pinned [skills CLI 1.7.6](https://www.npmjs.com/package/skills/v/1.7.6):
 
 ```bash
-npx skills add https://your-proxy -a claude-code
+npx --yes skills@1.7.6 add https://your-proxy \
+  --skill pdf-summarizer --agent codex claude-code --copy --yes
 ```
+
+Replace `pdf-summarizer` with a skill name in your public index. The CLI installs the package for both selected agents. Use `--list` instead of the selection and installation flags to inspect the available skills.
+
+The [pinned CLI's well-known provider](https://github.com/vercel-labs/skills/blob/7a5e920bead4b1039a6d6df5d7e1163b7b09423a/src/providers/wellknown.ts) sends no LiteLLM authentication headers when it fetches the index or archive URLs. This installation flow therefore requires anonymous access to the selected package. For private skills, download the archive with an authorized key through the neutral API above. The Claude marketplace's `?key=` flow remains separate.
